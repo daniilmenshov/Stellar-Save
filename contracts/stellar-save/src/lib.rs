@@ -456,6 +456,100 @@ impl StellarSaveContract {
         Ok(member_profile)
     }
 
+    /// Allows a member to leave a group before it activates.
+    /// 
+    /// Members can only leave groups that are in Pending status (not yet activated).
+    /// This function removes the member's data, adjusts payout positions for remaining
+    /// members, and decrements the group's member count.
+    /// 
+    /// # Arguments
+    /// * `env` - Soroban environment
+    /// * `group_id` - ID of the group to leave
+    /// * `member` - Address of the member leaving (must be caller)
+    /// 
+    /// # Returns
+    /// * `Ok(())` - Member successfully left the group
+    /// * `Err(StellarSaveError::GroupNotFound)` - Group doesn't exist
+    /// * `Err(StellarSaveError::NotMember)` - Caller is not a member
+    /// * `Err(StellarSaveError::InvalidState)` - Group is already active
+    /// 
+    /// # Example
+    /// ```ignore
+    /// contract.leave_group(env, 1, member_address)?;
+    /// ```
+    pub fn leave_group(
+        env: Env,
+        group_id: u64,
+        member: Address,
+    ) -> Result<(), StellarSaveError> {
+        // Task 1: Verify caller is member
+        member.require_auth();
+        
+        // Load group from storage
+        let group_key = StorageKeyBuilder::group_data(group_id);
+        let mut group: Group = env.storage()
+            .persistent()
+            .get(&group_key)
+            .ok_or(StellarSaveError::GroupNotFound)?;
+        
+        // Task 2: Check group not yet active
+        let status_key = StorageKeyBuilder::group_status(group_id);
+        let status: GroupStatus = env.storage()
+            .persistent()
+            .get(&status_key)
+            .unwrap_or(GroupStatus::Pending);
+        
+        if status != GroupStatus::Pending {
+            return Err(StellarSaveError::InvalidState);
+        }
+        
+        // Verify member exists
+        let member_key = StorageKeyBuilder::member_profile(group_id, member.clone());
+        if !env.storage().persistent().has(&member_key) {
+            return Err(StellarSaveError::NotMember);
+        }
+        
+        // Task 3: Remove member data
+        env.storage().persistent().remove(&member_key);
+        
+        // Remove from member list
+        let members_key = StorageKeyBuilder::group_members(group_id);
+        let mut members: Vec<Address> = env.storage()
+            .persistent()
+            .get(&members_key)
+            .unwrap_or(Vec::new(&env));
+        
+        // Find and remove member from list
+        let mut new_members = Vec::new(&env);
+        for i in 0..members.len() {
+            let addr = members.get(i).unwrap();
+            if addr != member {
+                new_members.push_back(addr);
+            }
+        }
+        
+        // Task 4: Adjust payout positions
+        // In a Pending group, payout positions would be assigned when activated
+        // So we just need to update the member list
+        env.storage().persistent().set(&members_key, &new_members);
+        
+        // Update group member count
+        group.member_count = group.member_count.saturating_sub(1);
+        env.storage().persistent().set(&group_key, &group);
+        
+        // Task 5: Emit event
+        let timestamp = env.ledger().timestamp();
+        EventEmitter::emit_member_left(
+            &env,
+            group_id,
+            member,
+            group.member_count,
+            timestamp,
+        );
+        
+        Ok(())
+    }
+
     /// Activates a group once minimum members have joined.
     /// 
     /// # Arguments
@@ -938,5 +1032,200 @@ mod tests {
         
         // Assert: Returned address equals query address parameter
         assert_eq!(result.address, member_address);
+    }
+
+    // Task 5: Tests for leave_group function
+    
+    // Task 5.1: Test successful member leaving
+    #[test]
+    fn test_leave_group_success() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, StellarSaveContract);
+        let client = StellarSaveContractClient::new(&env, &contract_id);
+        
+        // Setup: Create a group with members
+        let group_id = 1;
+        let creator = Address::generate(&env);
+        let member1 = Address::generate(&env);
+        let member2 = Address::generate(&env);
+        let joined_at = 1704067200u64;
+        
+        // Store group data
+        let mut group = Group::new(group_id, creator.clone(), 100, 3600, 5, 2, joined_at);
+        group.member_count = 3;
+        let group_key = StorageKeyBuilder::group_data(group_id);
+        env.storage().persistent().set(&group_key, &group);
+        
+        // Store group status as Pending
+        let status_key = StorageKeyBuilder::group_status(group_id);
+        env.storage().persistent().set(&status_key, &GroupStatus::Pending);
+        
+        // Store member list
+        let mut members = Vec::new(&env);
+        members.push_back(creator.clone());
+        members.push_back(member1.clone());
+        members.push_back(member2.clone());
+        let members_key = StorageKeyBuilder::group_members(group_id);
+        env.storage().persistent().set(&members_key, &members);
+        
+        // Store member profile
+        let member_profile = MemberProfile {
+            address: member1.clone(),
+            group_id,
+            joined_at,
+        };
+        let member_key = StorageKeyBuilder::member_profile(group_id, member1.clone());
+        env.storage().persistent().set(&member_key, &member_profile);
+        
+        // Test: Member leaves the group
+        client.leave_group(&group_id, &member1);
+        
+        // Assert: Member is removed
+        assert!(!env.storage().persistent().has(&member_key));
+        
+        // Assert: Member count decreased
+        let updated_group: Group = env.storage().persistent().get(&group_key).unwrap();
+        assert_eq!(updated_group.member_count, 2);
+        
+        // Assert: Member removed from list
+        let updated_members: Vec<Address> = env.storage().persistent().get(&members_key).unwrap();
+        assert_eq!(updated_members.len(), 2);
+        assert_eq!(updated_members.get(0).unwrap(), creator);
+        assert_eq!(updated_members.get(1).unwrap(), member2);
+    }
+    
+    // Task 5.2: Test leaving when not a member
+    #[test]
+    #[should_panic(expected = "Status(ContractError(2002))")] // 2002 is NotMember
+    fn test_leave_group_not_member() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, StellarSaveContract);
+        let client = StellarSaveContractClient::new(&env, &contract_id);
+        
+        // Setup: Create a group
+        let group_id = 1;
+        let creator = Address::generate(&env);
+        let non_member = Address::generate(&env);
+        let joined_at = 1704067200u64;
+        
+        // Store group data
+        let group = Group::new(group_id, creator.clone(), 100, 3600, 5, 2, joined_at);
+        let group_key = StorageKeyBuilder::group_data(group_id);
+        env.storage().persistent().set(&group_key, &group);
+        
+        // Store group status as Pending
+        let status_key = StorageKeyBuilder::group_status(group_id);
+        env.storage().persistent().set(&status_key, &GroupStatus::Pending);
+        
+        // Test: Non-member tries to leave
+        client.leave_group(&group_id, &non_member);
+    }
+    
+    // Task 5.3: Test leaving when group is active
+    #[test]
+    #[should_panic(expected = "Status(ContractError(1003))")] // 1003 is InvalidState
+    fn test_leave_group_already_active() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, StellarSaveContract);
+        let client = StellarSaveContractClient::new(&env, &contract_id);
+        
+        // Setup: Create an active group
+        let group_id = 1;
+        let creator = Address::generate(&env);
+        let member = Address::generate(&env);
+        let joined_at = 1704067200u64;
+        
+        // Store group data
+        let group = Group::new(group_id, creator.clone(), 100, 3600, 5, 2, joined_at);
+        let group_key = StorageKeyBuilder::group_data(group_id);
+        env.storage().persistent().set(&group_key, &group);
+        
+        // Store group status as Active
+        let status_key = StorageKeyBuilder::group_status(group_id);
+        env.storage().persistent().set(&status_key, &GroupStatus::Active);
+        
+        // Store member profile
+        let member_profile = MemberProfile {
+            address: member.clone(),
+            group_id,
+            joined_at,
+        };
+        let member_key = StorageKeyBuilder::member_profile(group_id, member.clone());
+        env.storage().persistent().set(&member_key, &member_profile);
+        
+        // Test: Member tries to leave active group
+        client.leave_group(&group_id, &member);
+    }
+    
+    // Task 5.4: Test leaving non-existent group
+    #[test]
+    #[should_panic(expected = "Status(ContractError(1001))")] // 1001 is GroupNotFound
+    fn test_leave_group_not_found() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, StellarSaveContract);
+        let client = StellarSaveContractClient::new(&env, &contract_id);
+        
+        let member = Address::generate(&env);
+        
+        // Test: Try to leave non-existent group
+        client.leave_group(&999, &member);
+    }
+    
+    // Task 5.5: Test member list adjustment after leaving
+    #[test]
+    fn test_leave_group_member_list_adjustment() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, StellarSaveContract);
+        let client = StellarSaveContractClient::new(&env, &contract_id);
+        
+        // Setup: Create a group with 4 members
+        let group_id = 1;
+        let creator = Address::generate(&env);
+        let member1 = Address::generate(&env);
+        let member2 = Address::generate(&env);
+        let member3 = Address::generate(&env);
+        let joined_at = 1704067200u64;
+        
+        // Store group data
+        let mut group = Group::new(group_id, creator.clone(), 100, 3600, 5, 2, joined_at);
+        group.member_count = 4;
+        let group_key = StorageKeyBuilder::group_data(group_id);
+        env.storage().persistent().set(&group_key, &group);
+        
+        // Store group status as Pending
+        let status_key = StorageKeyBuilder::group_status(group_id);
+        env.storage().persistent().set(&status_key, &GroupStatus::Pending);
+        
+        // Store member list
+        let mut members = Vec::new(&env);
+        members.push_back(creator.clone());
+        members.push_back(member1.clone());
+        members.push_back(member2.clone());
+        members.push_back(member3.clone());
+        let members_key = StorageKeyBuilder::group_members(group_id);
+        env.storage().persistent().set(&members_key, &members);
+        
+        // Store member profile for member2 (middle member)
+        let member_profile = MemberProfile {
+            address: member2.clone(),
+            group_id,
+            joined_at,
+        };
+        let member_key = StorageKeyBuilder::member_profile(group_id, member2.clone());
+        env.storage().persistent().set(&member_key, &member_profile);
+        
+        // Test: Member2 leaves the group
+        client.leave_group(&group_id, &member2);
+        
+        // Assert: Member list is correctly adjusted
+        let updated_members: Vec<Address> = env.storage().persistent().get(&members_key).unwrap();
+        assert_eq!(updated_members.len(), 3);
+        assert_eq!(updated_members.get(0).unwrap(), creator);
+        assert_eq!(updated_members.get(1).unwrap(), member1);
+        assert_eq!(updated_members.get(2).unwrap(), member3);
+        
+        // Assert: Member count is correct
+        let updated_group: Group = env.storage().persistent().get(&group_key).unwrap();
+        assert_eq!(updated_group.member_count, 3);
     }
 }
