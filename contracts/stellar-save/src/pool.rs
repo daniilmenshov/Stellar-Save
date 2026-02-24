@@ -673,4 +673,31 @@ mod tests {
             assert_eq!(result.unwrap(), *expected);
         }
     }
+
+    #[test]
+    fn test_calculate_payout_amount_v1() {
+        let total_pool = 10_000_000i128;
+        let result = PoolCalculator::calculate_payout_amount(total_pool);
+        
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 10_000_000i128); // 0 fees in v1
+    }
+
+    #[test]
+    fn test_calculate_payout_amount_zero() {
+        let total_pool = 0i128;
+        let result = PoolCalculator::calculate_payout_amount(total_pool);
+        
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 0i128);
+    }
+
+    #[test]
+    fn test_calculate_payout_amount_invalid() {
+        let total_pool = -1_000_000i128;
+        let result = PoolCalculator::calculate_payout_amount(total_pool);
+        
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), StellarSaveError::InvalidAmount);
+    }
 }
